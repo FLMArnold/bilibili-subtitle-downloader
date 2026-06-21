@@ -1,0 +1,8 @@
+__pycache__/
+.venv/
+.idea/
+.superpowers/
+.bilibili_cookie
+*.txt
+start_opencode.bat
+doc2md.py
