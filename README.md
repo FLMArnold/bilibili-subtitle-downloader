@@ -14,6 +14,8 @@ bilibili_subtitle.bat BV1Lt421w7UY --cookie "SESSDATA=xxx; buvid3=xxx"
 
 ## 用法
 
+得到的文本文件不要仅保存在脚本同目录下，会覆盖
+
 ```bash
 # 视频 ID 支持 BV 号、AV 号、完整 URL
 bilibili_subtitle.bat BV1Lt421w7UY
