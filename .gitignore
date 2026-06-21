@@ -1,8 +1,37 @@
+# Python
 __pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
 .venv/
+
+# IDE
 .idea/
-.superpowers/
+.vscode/
+
+# B站 Cookie（含 SESSDATA 敏感信息）
 .bilibili_cookie
+
+# API keys / secrets
+.env
+.env.local
+
+# AI agent working files（含项目计划、架构设计等内部文档）
+.superpowers/
+
+# AI 设计文档（同上，避免内部设计泄露）
+docs/superpowers/
+
+# Test outputs
 *.txt
+
+# Local tools (not part of the project)
 start_opencode.bat
 doc2md.py
+
+# OS
+.DS_Store
+Thumbs.db
