@@ -6,7 +6,7 @@ import argparse
 import sys
 import urllib.parse
 from pathlib import Path
-from datetime import datetime, timezone
+
 
 import requests
 
@@ -34,6 +34,7 @@ class BilibiliAPI:
                     k, v = part.split("=", 1)
                     self._session.cookies.set(k.strip(), v.strip())
         self._wbi_keys = None
+        self._wbi_keys_ts = 0
 
     @staticmethod
     def normalize_id(video_id: str) -> str:
@@ -79,6 +80,9 @@ class BilibiliAPI:
         for attempt in range(1, self.RETRIES + 1):
             try:
                 resp = self._session.get(url, params=params, timeout=15)
+                if resp.status_code == 429:
+                    time.sleep(5 * attempt)
+                    continue
                 resp.raise_for_status()
                 data = resp.json()
                 if data.get("code") != 0:
@@ -93,7 +97,7 @@ class BilibiliAPI:
         raise BilibiliAPIError(f"请求失败（重试 {self.RETRIES} 次）: {last_err}")
 
     def _get_wbi_keys(self):
-        if self._wbi_keys is not None:
+        if self._wbi_keys is not None and time.time() - self._wbi_keys_ts < 3600:
             return self._wbi_keys
         try:
             resp = self._session.get(f"{self.BASE_URL}/x/web-interface/nav", timeout=15)
@@ -106,6 +110,7 @@ class BilibiliAPI:
             img_key = img_url.rsplit("/", 1)[1].split(".")[0]
             sub_key = sub_url.rsplit("/", 1)[1].split(".")[0]
             self._wbi_keys = (img_key, sub_key)
+            self._wbi_keys_ts = time.time()
             return img_key, sub_key
         except Exception:
             return None, None
@@ -128,7 +133,9 @@ class BilibiliAPI:
         result = []
         for sub in subtitles:
             url = sub.get("subtitle_url", "")
-            if url and not url.startswith("http"):
+            if not url:
+                continue
+            if not url.startswith("http"):
                 url = "https:" + url
             result.append({
                 "lan": sub.get("lan", ""),
@@ -153,6 +160,8 @@ class BilibiliAPI:
         return result
 
     def download_subtitle(self, url: str) -> list:
+        if "?" in url:
+            url = f"{url}&_={int(time.time() * 1000)}"
         last_err = None
         for attempt in range(1, self.RETRIES + 1):
             try:
@@ -242,39 +251,24 @@ class FileWriter:
         return str(filepath)
 
 
-def parse_sessdata_expiry(sessdata: str) -> float | None:
-    try:
-        s = sessdata.replace("%2C", ",").replace("%2c", ",")
-        parts = s.split(",")
-        if len(parts) >= 2:
-            ts = int(parts[1])
-            remaining = (datetime.fromtimestamp(ts, tz=timezone.utc) - datetime.now(timezone.utc)).total_seconds() / 86400
-            return remaining
-    except (ValueError, IndexError):
-        pass
-    return None
-
-
-def cookie_expiry_status(cookie: str) -> tuple[str, float | None]:
-    """Return (status_label, remaining_days)."""
+def verify_cookie(cookie: str) -> bool:
+    """实测验证 Cookie 是否真实有效，而非靠过期时间推测。"""
     if not cookie:
-        return "none", None
-    m = re.search(r"SESSDATA=([^;]+)", cookie)
-    if not m:
-        return "no_sessdata", None
-    remaining = parse_sessdata_expiry(m.group(1))
-    if remaining is None:
-        return "unknown", None
-    return "ok", remaining
+        return False
+    try:
+        s = requests.Session()
+        s.headers.update({"User-Agent": BilibiliAPI.USER_AGENT})
+        for part in cookie.split(";"):
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                s.cookies.set(k.strip(), v.strip())
+        resp = s.get("https://api.bilibili.com/x/web-interface/nav", timeout=15)
+        data = resp.json()
+        return data.get("data", {}).get("isLogin", False)
+    except Exception:
+        return False
 
-
-COOKIE_HELP = """\
-获取Cookie的方法：
-  浏览器打开 bilibili.com → F12 → 应用(Application) → Cookie
-  复制 SESSDATA 和 buvid3 的值
-
-  或下次直接传入：--cookie "SESSDATA=xxx; buvid3=xxx"
-"""
 
 COOKIE_FILE = Path(__file__).parent / ".bilibili_cookie"
 
@@ -289,31 +283,24 @@ def load_cookie() -> str:
     return ""
 
 
-def prompt_cookie_if_needed(cookie: str) -> str:
-    status, remaining = cookie_expiry_status(cookie)
-    if status == "none":
-        need = True
-        reason = "无Cookie"
-    elif status == "no_sessdata":
-        need = True
-        reason = "Cookie不含SESSDATA"
-    elif status == "unknown":
-        need = True
-        reason = "无法解析Cookie有效期"
-    elif remaining <= 1:
-        need = True
-        reason = f"Cookie仅剩{remaining:.1f}天过期"
-    else:
-        need = False
-        reason = ""
+COOKIE_HELP = """\
+获取Cookie的方法：
+  浏览器打开 bilibili.com → F12 → 应用(Application) → Cookie
+  复制 SESSDATA 和 buvid3 的值
 
-    if not need:
-        if remaining >= 14:
-            return cookie
-        print(f"  [Cookie 剩余 {remaining:.0f} 天]")
+  示例：--cookie "SESSDATA=xxx; buvid3=xxx"
+"""
+
+
+def prompt_cookie_if_needed(cookie: str) -> str:
+    if cookie and verify_cookie(cookie):
         return cookie
 
-    print(f"\n  [{reason}] 需要登录Cookie才能获取AI字幕。")
+    if cookie:
+        print("  [Cookie 已验证无效，请重新输入]")
+    else:
+        print("  [未提供Cookie]")
+
     print(COOKIE_HELP)
     reply = input("  是否输入Cookie？(y/N): ").strip().lower()
     if reply != "y":
@@ -324,12 +311,45 @@ def prompt_cookie_if_needed(cookie: str) -> str:
         print("  输入为空，跳过。")
         return cookie
     new_cookie = f"SESSDATA={sessdata}; buvid3={buvid3}"
-    save_cookie(new_cookie)
-    print("  [Cookie 已保存到本地，下次启动自动加载]")
+    if verify_cookie(new_cookie):
+        save_cookie(new_cookie)
+        print("  [Cookie 已验证有效，已保存到本地]")
+    else:
+        print("  [警告：Cookie 未通过 API 验证，可能无效]")
+        save_cookie(new_cookie)
     return new_cookie
 
 
-def process_one(video_id: str, page: int, cookie: str, output_dir: str) -> str:
+def fetch_subtitles_with_consensus(
+    api, bvid: str, cid: int, max_attempts: int, interval: float
+) -> list:
+    seen = {}
+    for attempt in range(1, max_attempts + 1):
+        subs = api.get_subtitle_list(bvid, cid)
+        if not subs:
+            continue
+        ch = SubtitleProcessor.extract_chinese(subs)
+        raw = api.download_subtitle(ch["url"])
+        if not raw:
+            continue
+        fingerprint = raw[0]["content"].strip()[:60]
+
+        if fingerprint in seen:
+            return raw
+
+        seen[fingerprint] = raw
+        if attempt < max_attempts:
+            time.sleep(interval)
+
+    if seen:
+        return max(seen.values(), key=len)
+    return []
+
+
+def process_one(
+    video_id: str, page: int, cookie: str,
+    output_dir: str, retry: int, retry_interval: float
+) -> str:
     api = BilibiliAPI(cookie=cookie)
     info = api.get_video_info(video_id)
 
@@ -340,14 +360,13 @@ def process_one(video_id: str, page: int, cookie: str, output_dir: str) -> str:
     else:
         cid = info["cid"]
 
-    subs = api.get_subtitle_list(info["bvid"], cid)
-    if not subs:
+    raw_segs = fetch_subtitles_with_consensus(
+        api, info["bvid"], cid, retry, retry_interval
+    )
+    if not raw_segs:
         raise BilibiliAPIError("没有找到字幕")
 
-    ch_sub = SubtitleProcessor.extract_chinese(subs)
-    raw_segs = api.download_subtitle(ch_sub["url"])
     segs = SubtitleProcessor.process_segments(raw_segs)
-
     p1 = FileWriter.write_plain(segs, info["title"], output_dir)
     p2 = FileWriter.write_timestamped(segs, info["title"], output_dir)
     return f"纯文本: {p1}\n时间戳: {p2}"
@@ -359,13 +378,14 @@ def main():
     parser.add_argument("-o", "--output", default=".", help="输出目录（默认当前目录）")
     parser.add_argument("-p", "--page", type=int, default=1, help="分P编号（默认1）")
     parser.add_argument("--cookie", default="", help="B站登录Cookie (SESSDATA=xxx; buvid3=xxx)")
+    parser.add_argument("--retry", type=int, default=3, help="字幕一致性尝试次数（默认3）")
+    parser.add_argument("--retry-interval", type=float, default=3, help="重试间隔秒数（默认3）")
     args = parser.parse_args()
 
     video_ids = args.video_id
     if not video_ids:
         raw = input("请输入B站视频 BV号 或 AV号（多个用空格分隔）: ").strip()
         video_ids = raw.split()
-    # 标准化：提取 URL 中的 BV/AV
     cleaned = []
     for vid in video_ids:
         if "/video/" in vid:
@@ -377,7 +397,6 @@ def main():
         saved = load_cookie()
         if saved:
             cookie = saved
-            print(f"  [已加载本地保存的Cookie]")
     else:
         save_cookie(cookie)
 
@@ -386,7 +405,10 @@ def main():
             print(f"\n[{i + 1}/{len(cleaned)}] {vid}")
         try:
             cookie = prompt_cookie_if_needed(cookie)
-            result = process_one(vid, args.page, cookie, args.output)
+            result = process_one(
+                vid, args.page, cookie, args.output,
+                args.retry, args.retry_interval
+            )
             print(result)
         except BilibiliAPIError as e:
             print(f"错误: {e}", file=sys.stderr)
@@ -396,6 +418,8 @@ def main():
             print(f"意外错误: {e}", file=sys.stderr)
             if i < len(cleaned) - 1:
                 print("继续处理下一个视频...")
+        if i < len(cleaned) - 1:
+            time.sleep(2)
 
 
 if __name__ == "__main__":
